@@ -7,3 +7,4 @@ tmp.json
 *.xml
 *.iml
 output
+*-SSL-tests.html
