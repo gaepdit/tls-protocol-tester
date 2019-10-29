@@ -8,8 +8,6 @@ echo "░▒▓█ Testing 10.149.210.226" >> output
 ./testssl.sh -p -q 10.149.210.226 >> output
 echo "░▒▓█ Testing 10.149.210.227" >> output
 ./testssl.sh -p -q 10.149.210.227 >> output
-echo "░▒▓█ Testing 10.149.210.228" >> output
-./testssl.sh -p -q 10.149.210.228 >> output
 echo "░▒▓█ Testing 10.149.211.66" >> output
 ./testssl.sh -p -q 10.149.211.66 >> output
 echo "░▒▓█ Testing 10.149.211.67" >> output
