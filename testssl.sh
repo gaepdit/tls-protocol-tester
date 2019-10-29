@@ -285,9 +285,12 @@ NR_SOCKET_FAIL=0                        # Counter for socket failures
 NR_OSSL_FAIL=0                          # .. for OpenSSL connects
 NR_HEADER_FAIL=0                        # .. for HTTP_GET
 PROTOS_OFFERED=""                       # This keeps which protocol is being offered. See has_server_protocol().
+TLS12_CIPHER_OFFERED=""                 # This contains the hexcode of a cipher known to be supported by the server with TLS 1.2
 CURVES_OFFERED=""                       # This keeps which curves have been detected. Just for error handling
 KNOWN_OSSL_PROB=false                   # We need OpenSSL a few times. This variable is an indicator if we can't connect. Eases handling
-DETECTED_TLS_VERSION=""
+DETECTED_TLS_VERSION=""                 # .. as hex string, e.g. 0300 or 0303
+TLS13_ONLY=false                        # Does the server support TLS 1.3 ONLY?
+OSSL_SHORTCUT=${OSSL_SHORTCUT:-false}   # Hack: if during the scan turns out the OpenSSL binary suports TLS 1.3 would be a better choice, this enables it.
 TLS_EXTENSIONS=""
 declare -r NPN_PROTOs="spdy/4a2,spdy/3,spdy/3.1,spdy/2,spdy/1,http/1.1"
 # alpn_protos needs to be space-separated, not comma-seperated, including odd ones observed @ facebook and others, old ones like h2-17 omitted as they could not be found
@@ -376,6 +379,8 @@ STARTTLS_PROTOCOL=""
 OPTIMAL_PROTO=""                        # Need this for IIS6 (sigh) + OpenSSL 1.0.2, otherwise some handshakes will fail see
                                         # https://github.com/PeterMosmans/openssl/issues/19#issuecomment-100897892
 STARTTLS_OPTIMAL_PROTO=""               # Same for STARTTLS, see https://github.com/drwetter/testssl.sh/issues/188
+OPTIMAL_SOCKETS_PROTO=""                # Same for tls_sockets(). -- not yet used
+ALL_FAILED_SOCKETS=true                 # Set to true if all attempts to connect to server using tls_sockets/sslv2_sockets failed
 TLS_TIME=""                             # To keep the value of TLS server timestamp
 TLS_NOW=""                              # Similar
 TLS_DIFFTIME_SET=false                  # Tells TLS functions to measure the TLS difftime or not
@@ -1487,7 +1492,7 @@ tmpfile_handle() {
 
 # arg1: line with comment sign, tabs and so on
 filter_input() {
-     sed -e 's/#.*$//' -e '/^$/d' <<< "$1" | tr -d '\n' | tr -d '\t'
+     sed -e 's/#.*$//' -e '/^$/d' <<< "$1" | tr -d '\n' | tr -d '\t' | tr -d '\r'
 }
 
 # Dl's any URL (arg1) via HTTP 1.1 GET from port 80, arg2: file to store http body.
@@ -1700,9 +1705,9 @@ check_revocation_crl() {
      [[ -n "$GOOD_CA_BUNDLE" ]] || return 0
      scheme="$(tolower "${crl%%://*}")"
      # The code for obtaining CRLs only supports LDAP, HTTP, and HTTPS URLs.
-     [[ "$scheme" == "http" ]] || [[ "$scheme" == "https" ]] || [[ "$scheme" == "ldap" ]] || return 0
+     [[ "$scheme" == http ]] || [[ "$scheme" == https ]] || [[ "$scheme" == ldap ]] || return 0
      tmpfile=$TEMPDIR/${NODE}-${NODEIP}.${crl##*\/} || exit $ERR_FCREATE
-     if [[ "$scheme" == "ldap" ]]; then
+     if [[ "$scheme" == ldap ]]; then
           ldap_get "$crl" "$tmpfile" "$jsonID"
           success=$?
      else
@@ -1735,7 +1740,7 @@ check_revocation_crl() {
           fileout "$jsonID" "OK" "not revoked"
      else
           retcode=$(awk '/error [1-9][0-9]? at [0-9]+ depth lookup:/ { if (!found) {print $2; found=1} }' "${tmpfile%%.crl}.err")
-          if [[ "$retcode" == "23" ]]; then # see verify_retcode_helper()
+          if [[ "$retcode" == 23 ]]; then # see verify_retcode_helper()
                out ", "
                pr_svrty_critical "revoked"
                fileout "$jsonID" "CRITICAL" "revoked"
@@ -2078,7 +2083,11 @@ service_detection() {
 #
 connectivity_problem() {
      if [[ $1 -lt $2 ]]; then
-          prln_warning " Oops: $3"
+          if "$TLS13_ONLY" && ! "$HAS_TLS13"; then
+               :
+          else
+               prln_warning " Oops: $3"
+          fi
           return 0
      fi
      if [[ $1 -ge $2 ]]; then
@@ -2166,11 +2175,13 @@ run_http_header() {
      # Populate vars for HTTP time
      debugme echo "$NOW_TIME: $HTTP_TIME"
 
-     # delete from pattern til the end. We ignore any leading spaces (e.g. www.amazon.de)
-     sed -e '/<HTML>/,$d' -e '/<html>/,$d' -e '/<\!DOCTYPE/,$d' -e '/<\!doctype/,$d' \
-         -e '/<XML/,$d' -e '/<xml/,$d' -e '/<\?XML/,$d' -e '/<?xml/,$d' $HEADERFILE >$HEADERFILE.tmp
-         # ^^^ Attention: filtering is for html body only as of now, doesn't work for other content yet
-     mv $HEADERFILE.tmp $HEADERFILE
+     # Quit on first empty line to catch 98% of the cases. Next pattern is there because the SEDs tested
+     # so far seem not to be fine with header containing x0d x0a (CRLF) which is the usal case.
+     # So we also trigger also on any sign on a single line which is not alphanumeric (plus _)
+     sed -e '/^$/q' -e '/^[^a-zA-Z_0-9]$/q' $HEADERFILE >$HEADERFILE.tmp
+     # Now to be more sure we delete from '<' or '{' maybe with a leading blank until the end
+     sed -e '/^ *<.*$/d' -e '/^ *{.*$/d'  $HEADERFILE.tmp >$HEADERFILE
+     debugme echo -e "---\n $(< $HEADERFILE) \n---"
 
      HTTP_STATUS_CODE=$(awk '/^HTTP\// { print $2 }' $HEADERFILE 2>>$ERRFILE)
      msg_thereafter=$(awk -F"$HTTP_STATUS_CODE" '/^HTTP\// { print $2 }' $HEADERFILE 2>>$ERRFILE)   # dirty trick to use the status code as a
@@ -3040,7 +3051,7 @@ run_security_headers() {
                fi
                pr_litecyan "$header"
                outln " $HEADERVALUE"     # shouldn't be that long
-               fileout "$header" "INFO" "$header: $HEADERVALUE"
+               fileout "$header" "INFO" "$HEADERVALUE"
           fi
      done
      #TODO: I am not testing for the correctness or anything stupid yet, e.g. "X-Frame-Options: allowall" or Access-Control-Allow-Origin: *
@@ -4294,7 +4305,7 @@ modify_clienthello() {
      offset+=4
      for (( 1; offset < tls_handshake_ascii_len; 1 )); do
           extension_type="${tls_handshake_ascii:$offset:4}"
-          offset+=+4
+          offset+=4
           len_extension=2*$(hex2dec "${tls_handshake_ascii:$offset:4}")
 
           if [[ "$extension_type" == 0000 ]] && [[ -z "$new_key_share" ]]; then
@@ -4311,8 +4322,8 @@ modify_clienthello() {
                     len_sni_listlen=$(printf "%02x\n" $((len_servername+3)))
                     len_sni_ext=$(printf "%02x\n" $((len_servername+5)))
                     tls_extensions+="000000${len_sni_ext}00${len_sni_listlen}0000${len_servername_hex}${servername_hexstr}"
-                    offset+=$len_extension+4
                fi
+               offset+=$len_extension+4
           elif [[ "$extension_type" != 00$KEY_SHARE_EXTN_NR ]] || [[ -z "$new_key_share" ]]; then
                # If this is in response to a HelloRetryRequest, then do
                # not copy over the old key_share extension, but
@@ -4860,7 +4871,9 @@ run_protocols() {
      local lines nr_ciphers_detected
      local tls13_ciphers_to_test=""
      local i drafts_offered=""  drafts_offered_str="" supported_versions debug_recomm=""
-     local -i ret=0 subret=0
+     local tls12_detected_version
+     local -i ret=0 ret_val_ssl3 ret_val_tls1 ret_val_tls11 ret_val_tls12=0 ret_val_tls13=0
+     local offers_tls13=false
      local jsonID="SSLv2"
 
      outln; pr_headline " Testing protocols "
@@ -4953,12 +4966,16 @@ run_protocols() {
 
      pr_bold " SSLv3      ";
      jsonID="SSLv3"
-     if "$using_sockets"; then
+     if [[ $(has_server_protocol ssl3) -eq 0 ]]; then
+          ret_val_ssl3=0
+     elif "$using_sockets"; then
           tls_sockets "00" "$TLS_CIPHER"
+          ret_val_ssl3=$?
      else
           run_prototest_openssl "-ssl3"
+          ret_val_ssl3=$?
      fi
-     case $? in
+     case $ret_val_ssl3 in
           0)   prln_svrty_high "offered (NOT ok)"
                fileout "$jsonID" "HIGH" "offered"
                latest_supported="0300"
@@ -5015,14 +5032,18 @@ run_protocols() {
 
      pr_bold " TLS 1      ";
      jsonID="TLS1"
-     if "$using_sockets"; then
+     if [[ $(has_server_protocol tls1) -eq 0 ]]; then
+          ret_val_tls1=0
+     elif "$using_sockets"; then
           tls_sockets "01" "$TLS_CIPHER"
+          ret_val_tls1=$?
      else
           run_prototest_openssl "-tls1"
+          ret_val_tls1=$?
      fi
-     case $? in
-          0)   outln "offered"
-               fileout "$jsonID" "INFO" "offered"
+     case $ret_val_tls1 in
+          0)   pr_svrty_low "offered" ; outln " (deprecated)"
+               fileout "$jsonID" "LOW" "offered (deprecated)"
                latest_supported="0301"
                latest_supported_string="TLSv1.0"
                add_tls_offered tls1 yes
@@ -5089,14 +5110,18 @@ run_protocols() {
 
      pr_bold " TLS 1.1    ";
      jsonID="TLS1_1"
-     if "$using_sockets"; then
+     if [[ $(has_server_protocol tls1_1) -eq 0 ]]; then
+          ret_val_tls11=0
+     elif "$using_sockets"; then
           tls_sockets "02" "$TLS_CIPHER"
+          ret_val_tls11=$?
      else
           run_prototest_openssl "-tls1_1"
+          ret_val_tls11=$?
      fi
-     case $? in
-          0)   outln "offered"
-               fileout "$jsonID" "INFO" "offered"
+     case $ret_val_tls11 in
+          0)   pr_svrty_low "offered" ; outln " (deprecated)"
+               fileout "$jsonID" "LOW" "offered (deprecated)"
                latest_supported="0302"
                latest_supported_string="TLSv1.1"
                add_tls_offered tls1_1 yes
@@ -5164,66 +5189,99 @@ run_protocols() {
                ;;
      esac
 
-     pr_bold " TLS 1.2    ";
-     jsonID="TLS1_2"
-     if "$using_sockets"; then
+     # Now, we are doing a basic/pre test for TLS 1.2 and 1.3 in order not to penalize servers (medium)
+     # running TLS 1.3 only when TLS 1.2 is not offered.  0 and 5 are the return codes for
+     # TLS 1.3 support (kind of, including deprecated pre-versions of TLS 1.3)
+     if [[ $(has_server_protocol tls1_2) -eq 0 ]]; then
+          ret_val_tls12=0
+     elif "$using_sockets"; then
           tls_sockets "03" "$TLS12_CIPHER"
-          subret=$?
-          if [[ $subret -ne 0 ]]; then
-               tls_sockets "03" "$TLS12_CIPHER_2ND_TRY"
-               [[ $? -eq 0 ]] && subret=0
-               # see #807 and #806
-          fi
+          ret_val_tls12=$?
+          tls12_detected_version="$DETECTED_TLS_VERSION"
      else
           run_prototest_openssl "-tls1_2"
-          subret=$?
+          ret_val_tls12=$?
      fi
-     case $subret in
+
+     if [[ $(has_server_protocol tls1_3) -eq 0 ]]; then
+          ret_val_tls13=0
+     elif "$using_sockets"; then
+          # Need to ensure that at most 128 ciphers are included in ClientHello.
+          # If the TLSv1.2 test in determine_optimal_sockets_params()  was successful,
+          # then use the 5 TLSv1.3 ciphers plus the cipher selected in the TLSv1.2 test.
+          # If the TLSv1.2 test was not successful, then just use the 5 TLSv1.3 ciphers
+          # plus the list of ciphers used in all of the previous tests ($TLS_CIPHER).
+          if [[ -n "$TLS12_CIPHER_OFFERED" ]]; then
+               tls13_ciphers_to_test="$TLS13_CIPHER, $TLS12_CIPHER_OFFERED, 00,ff"
+          else
+               tls13_ciphers_to_test="$TLS13_CIPHER,$TLS_CIPHER"
+          fi
+          tls_sockets "04" "$tls13_ciphers_to_test"
+          ret_val_tls13=$?
+     else
+          run_prototest_openssl "-tls1_3"
+          ret_val_tls13=$?
+     fi
+     if [[ $ret_val_tls13 -eq 0 ]] || [[ $ret_val_tls13 -eq 5 ]]; then
+          offers_tls13=true             # This variable comes in handy for further if statements below
+     fi
+     # Done with pretesting TLS 1.2 and 1.3.
+
+     pr_bold " TLS 1.2    ";
+     jsonID="TLS1_2"
+     case $ret_val_tls12 in
           0)   prln_svrty_best "offered (OK)"
                fileout "$jsonID" "OK" "offered"
                latest_supported="0303"
                latest_supported_string="TLSv1.2"
                add_tls_offered tls1_2 yes
-               ;;                                  # GCM cipher in TLS 1.2: very good!
-          1)   pr_svrty_medium "not offered"
-               add_tls_offered tls1_2 no
+               ;;                                                     # GCM cipher in TLS 1.2: very good!
+          1)   add_tls_offered tls1_2 no
+               if "$offers_tls13"; then
+                    out "not offered"
+               else
+                    pr_svrty_medium "not offered"
+               fi
                if ! "$using_sockets" || [[ -z $latest_supported ]]; then
                     outln
-                    fileout "$jsonID" "MEDIUM" "not offered" # no GCM, penalty
+                    if "$offers_tls13"; then
+                         fileout "$jsonID" "INFO" "not offered"
+                    else
+                         fileout "$jsonID" "MEDIUM" "not offered"     # TLS 1.3, no TLS 1.2 --> no GCM, penalty
+                    fi
                else
                     prln_svrty_critical " -- connection failed rather than downgrading to $latest_supported_string"
                     fileout "$jsonID" "CRITICAL" "connection failed rather than downgrading to $latest_supported_string"
                fi
                ;;
-          2)   pr_svrty_medium "not offered"
-               add_tls_offered tls1_2 no
-               if [[ "$DETECTED_TLS_VERSION" == 0300 ]]; then
+          2)   add_tls_offered tls1_2 no
+               pr_svrty_medium "not offered and downgraded to a weaker protocol"
+               if [[ "$tls12_detected_version" == 0300 ]]; then
                     detected_version_string="SSLv3"
-               elif [[ "$DETECTED_TLS_VERSION" == 03* ]]; then
-                    detected_version_string="TLSv1.$((0x$DETECTED_TLS_VERSION-0x0301))"
+               elif [[ "$tls12_detected_version" == 03* ]]; then
+                    detected_version_string="TLSv1.$((0x$tls12_detected_version-0x0301))"
                fi
-               if [[ "$DETECTED_TLS_VERSION" == "$latest_supported" ]]; then
-                    [[ $DEBUG -ge 1 ]] && tm_out " -- downgraded"
+               if [[ "$tls12_detected_version" == "$latest_supported" ]]; then
                     outln
                     fileout "$jsonID" "MEDIUM" "not offered and downgraded to a weaker protocol"
-               elif [[ "$DETECTED_TLS_VERSION" == 03* ]] && [[ 0x$DETECTED_TLS_VERSION -lt 0x$latest_supported ]]; then
+               elif [[ "$tls12_detected_version" == 03* ]] && [[ 0x$tls12_detected_version -lt 0x$latest_supported ]]; then
                     prln_svrty_critical " -- server supports $latest_supported_string, but downgraded to $detected_version_string"
                     fileout "$jsonID" "CRITICAL" "not offered, and downgraded to $detected_version_string rather than $latest_supported_string"
-               elif [[ "$DETECTED_TLS_VERSION" == 03* ]] && [[ 0x$DETECTED_TLS_VERSION -gt 0x0303 ]]; then
+               elif [[ "$tls12_detected_version" == 03* ]] && [[ 0x$tls12_detected_version -gt 0x0303 ]]; then
                     prln_svrty_critical " -- server responded with higher version number ($detected_version_string) than requested by client"
                     fileout "$jsonID" "CRITICAL" "not offered, server responded with higher version number ($detected_version_string) than requested by client"
                else
-                    if [[ ${#DETECTED_TLS_VERSION} -eq 4 ]]; then
-                         prln_svrty_critical "server responded with version number ${DETECTED_TLS_VERSION:0:2}.${DETECTED_TLS_VERSION:2:2} (NOT ok)"
-                         fileout "$jsonID" "CRITICAL" "server responded with version number ${DETECTED_TLS_VERSION:0:2}.${DETECTED_TLS_VERSION:2:2}"
+                    if [[ ${#tls12_detected_version} -eq 4 ]]; then
+                         prln_svrty_critical "server responded with version number ${tls12_detected_version:0:2}.${tls12_detected_version:2:2} (NOT ok)"
+                         fileout "$jsonID" "CRITICAL" "server responded with version number ${tls12_detected_version:0:2}.${tls12_detected_version:2:2}"
                     else
-                         prln_svrty_medium " -- strange, server ${DETECTED_TLS_VERSION}"
-                         fileout "$jsonID" "MEDIUM" "strange, server ${DETECTED_TLS_VERSION}"
+                         prln_svrty_medium " -- strange, server ${tls12_detected_version}"
+                         fileout "$jsonID" "MEDIUM" "strange, server ${tls12_detected_version}"
                     fi
                fi
                ;;
            3)  out "not offered, "
-               fileout "$jsonID" "OK" "not offered"
+               fileout "$jsonID" "INFO" "not offered"
                add_tls_offered tls1_2 no
                pr_warning "TLS downgraded to STARTTLS plaintext"; outln
                fileout "$jsonID" "WARN" "TLS downgraded to STARTTLS plaintext"
@@ -5254,45 +5312,18 @@ run_protocols() {
 
      pr_bold " TLS 1.3    ";
      jsonID="TLS1_3"
-     if "$using_sockets"; then
-          # Need to ensure that at most 128 ciphers are included in ClientHello.
-          # If the TLSv1.2 test was successful, then use the 5 TLSv1.3 ciphers
-          # plus the cipher selected in the TLSv1.2 test. If the TLSv1.2 test was
-          # not successful, then just use the 5 TLSv1.3 ciphers plus the list of
-          # ciphers used in all of the previous tests ($TLS_CIPHER).
-          if [[ $subret -eq 0 ]] || [[ $subret -eq 2 ]]; then
-               tls13_ciphers_to_test="$(get_cipher "$TEMPDIR/$NODEIP.parse_tls_serverhello.txt")"
-               if [[ "$tls13_ciphers_to_test" == TLS_* ]] || [[ "$tls13_ciphers_to_test" == SSL_* ]]; then
-                    tls13_ciphers_to_test="$(rfc2hexcode "$tls13_ciphers_to_test")"
-               else
-                    tls13_ciphers_to_test="$(openssl2hexcode "$tls13_ciphers_to_test")"
-               fi
-          fi
-          if [[ ${#tls13_ciphers_to_test} -eq 9 ]]; then
-               tls13_ciphers_to_test="$TLS13_CIPHER, ${tls13_ciphers_to_test:2:2},${tls13_ciphers_to_test:7:2}, 00,ff"
-          else
-               tls13_ciphers_to_test="$TLS13_CIPHER,$TLS_CIPHER"
-          fi
-          tls_sockets "04" "$tls13_ciphers_to_test"
-     else
-          run_prototest_openssl "-tls1_3"
-     fi
-     case $? in
+     case $ret_val_tls13 in
           0)   if ! "$using_sockets"; then
                     prln_svrty_best "offered (OK)"
                     fileout "$jsonID" "OK" "offered"
                else
-                    # Determine which version of TLS 1.3 was offered. For drafts 18-21 the
-                    # version appears in the ProtocolVersion field of the ServerHello. For
-                    # drafts 22-28 and the final TLS 1.3 the ProtocolVersion field contains
-                    # 0303 and the actual version appears in the supported_versions extension.
-                    if [[ "${TLS_SERVER_HELLO:8:3}" == 7F1 ]]; then
-                         drafts_offered+=" ${TLS_SERVER_HELLO:8:4} "
-                    elif [[ "$TLS_SERVER_HELLO" =~ 002B00020304 ]]; then
+                    # If TLS 1.3 is offered, then its support was detected
+                    # by determine_optimal_sockets_params().
+                    if [[ $(has_server_protocol tls1_3_rfc8446) -eq 0 ]]; then
                          drafts_offered+=" 0304 "
                     else
                          for i in 1C 1B 1A 19 18 17 16 15 14 13 12; do
-                              if [[ "$TLS_SERVER_HELLO" =~ 002B00027F$i ]]; then
+                              if [[ $(has_server_protocol tls1_3_draft$(hex2dec "$i")) -eq 0 ]]; then
                                    drafts_offered+=" 7F$i "
                                    break
                               fi
@@ -5369,33 +5400,34 @@ run_protocols() {
                latest_supported_string="TLSv1.3"
                add_tls_offered tls1_3 yes
                ;;
-          1)   out "not offered"
+          1)   pr_svrty_low "not offered"
                if ! "$using_sockets" || [[ -z $latest_supported ]]; then
                     outln
-                    fileout "$jsonID" "INFO" "not offered"
+                    fileout "$jsonID" "LOW" "not offered"
                else
                     prln_svrty_critical " -- connection failed rather than downgrading to $latest_supported_string"
                     fileout "$jsonID" "CRITICAL" "connection failed rather than downgrading to $latest_supported_string"
                fi
                add_tls_offered tls1_3 no
                ;;
-          2)   out "not offered"
-               if [[ "$DETECTED_TLS_VERSION" == 0300 ]]; then
+          2)   if [[ "$DETECTED_TLS_VERSION" == 0300 ]]; then
                     detected_version_string="SSLv3"
                elif [[ "$DETECTED_TLS_VERSION" == 03* ]]; then
                     detected_version_string="TLSv1.$((0x$DETECTED_TLS_VERSION-0x0301))"
                fi
                if [[ "$DETECTED_TLS_VERSION" == "$latest_supported" ]]; then
-                    [[ $DEBUG -ge 1 ]] && tm_out " -- downgraded"
-                    outln
-                    fileout "$jsonID" "INFO" "not offered and downgraded to a weaker protocol"
+                    outln "not offered and downgraded to a weaker protocol"
+                    fileout "$jsonID" "INFO" "not offered + downgraded to weaker protocol"
                elif [[ "$DETECTED_TLS_VERSION" == 03* ]] && [[ 0x$DETECTED_TLS_VERSION -lt 0x$latest_supported ]]; then
+                    out "not offered"
                     prln_svrty_critical " -- server supports $latest_supported_string, but downgraded to $detected_version_string"
                     fileout "$jsonID" "CRITICAL" "not offered, and downgraded to $detected_version_string rather than $latest_supported_string"
                elif [[ "$DETECTED_TLS_VERSION" == 03* ]] && [[ 0x$DETECTED_TLS_VERSION -gt 0x0304 ]]; then
+                    out "not offered"
                     prln_svrty_critical " -- server responded with higher version number ($detected_version_string) than requested by client"
                     fileout "$jsonID" "CRITICAL" "not offered, server responded with higher version number ($detected_version_string) than requested by client"
                else
+                    out "not offered"
                     prln_svrty_critical " -- server responded with version number ${DETECTED_TLS_VERSION:0:2}.${DETECTED_TLS_VERSION:2:2}"
                     fileout "$jsonID" "CRITICAL" "server responded with version number ${DETECTED_TLS_VERSION:0:2}.${DETECTED_TLS_VERSION:2:2}"
                fi
@@ -5437,6 +5469,7 @@ run_protocols() {
           ignore_no_or_lame "You should not proceed as no protocol was detected. If you still really really want to, say \"YES\"" "YES"
           [[ $? -ne 0 ]] && exit $ERR_CLUELESS
      fi
+
      return $ret
 }
 
@@ -5966,24 +5999,24 @@ read_dhbits_from_file() {
           fi
           return 0
      fi
-     if [[ "$2" == "quiet" ]]; then
+     if [[ "$2" == quiet ]]; then
           tm_out "$bits"
           return 0
      fi
      [[ -z "$2" ]] && [[ -n "$bits" ]] && out ", "
-     if [[ $what_dh == "DH" ]] || [[ $what_dh == "EDH" ]]; then
+     if [[ $what_dh == DH ]] || [[ $what_dh == EDH ]]; then
           add="bit DH"
           [[ -n "$curve" ]] && add+=" ($curve)"
-          if [[ "$2" == "string" ]]; then
+          if [[ "$2" == string ]]; then
                tm_out ", $bits $add"
           else
                pr_dh_quality "$bits" "$bits $add"
           fi
      # https://wiki.openssl.org/index.php/Elliptic_Curve_Cryptography, http://www.keylength.com/en/compare/
-     elif [[ $what_dh == "ECDH" ]]; then
+     elif [[ $what_dh == ECDH ]]; then
           add="bit ECDH"
           [[ -n "$curve" ]] && add+=" ($curve)"
-          if [[ "$2" == "string" ]]; then
+          if [[ "$2" == string ]]; then
                tm_out ", $bits $add"
           else
                pr_ecdh_quality "$bits" "$bits $add"
@@ -6008,8 +6041,9 @@ sub_session_resumption() {
      local sess_data=$(mktemp $TEMPDIR/sub_session_data_resumption.$NODEIP.XXXXXX)
      local -a rw_line
      local not_new_reused=false
+     local protocol="$1"
 
-     if [[ "$1" == ID ]]; then
+     if [[ "$2" == ID ]]; then
           local byID=true
           local addcmd="-no_ticket"
      else
@@ -6020,7 +6054,21 @@ sub_session_resumption() {
           fi
      fi
      "$CLIENT_AUTH" && return 3
-     "$HAS_NO_SSL2" && addcmd+=" -no_ssl2" || addcmd+=" $OPTIMAL_PROTO"
+     if "$HAS_NO_SSL2"; then
+          addcmd+=" -no_ssl2"
+     else
+          protocol=${protocol/\./_}
+          protocol=${protocol/v/}
+          protocol="-$(tolower $protocol)"
+          # In some cases a server will not support session tickets, but will support session resumption
+          # by ID. In such a case, it may be more likely to support session resumption with TLSv1.2 than
+          # with TLSv1.3. So, if testing a server that does not support session tickets and that supports
+          # both TLSv1.3 and TLSv1.2 for session resumption by ID, then use a TLSv1.2 ClientHello. (Note that
+          # the line below assumes that if $protocol is -tls1_3, then the server either supports TLSv1.2 or
+          # is TLSv1.3-only.
+          ! "$TLS_TICKETS" && "$byID" && [[ $(has_server_protocol "tls1_2") -eq 0 ]] && protocol="-tls1_2" 
+          addcmd+=" $protocol"
+     fi
 
      $OPENSSL s_client $(s_client_options "$STARTTLS $BUGS -connect $NODEIP:$PORT $PROXY $SNI $addcmd -sess_out $sess_data") </dev/null &>/dev/null
      ret1=$?
@@ -6336,12 +6384,10 @@ run_server_preference() {
           [[ $TLS_NR_CIPHERS == 0 ]] && using_sockets=false
 
           pr_bold " Cipher order"
-
           while read proto_ossl proto_hex proto_txt; do
                cipher_pref_check "$proto_ossl" "$proto_hex" "$proto_txt" "$using_sockets"
           done <<< "$(tm_out " ssl3 00 SSLv3\n tls1 01 TLSv1\n tls1_1 02 TLSv1.1\n tls1_2 03 TLSv1.2\n tls1_3 04 TLSv1.3\n")"
           outln
-
           outln
      else
           pr_bold " Negotiated cipher per proto"; outln " $limitedsense"
@@ -8778,7 +8824,7 @@ certificate_info() {
 run_server_defaults() {
      local ciph newhostcert sni
      local match_found
-     local sessticket_lifetime_hint="" lifetime unit
+     local sessticket_lifetime_hint="" sessticket_proto="" lifetime unit
      local -i i n
      local -i certs_found=0
      local -i ret=0
@@ -8844,7 +8890,8 @@ run_server_defaults() {
                     cp "$TEMPDIR/$NODEIP.get_server_certificate.txt" $TMPFILE
                     >$ERRFILE
                     if [[ -z "$sessticket_lifetime_hint" ]]; then
-                         sessticket_lifetime_hint=$(awk '/session ticket life/' $TMPFILE)
+                         sessticket_lifetime_hint=$(awk '/session ticket life/ { if (!found) print; found=1 }' $TMPFILE)
+                         sessticket_proto="$(get_protocol "$TMPFILE")"
                     fi
 
                     if [[ $n -le 7 ]]; then
@@ -8997,11 +9044,23 @@ run_server_defaults() {
      if [[ $? -eq 0 ]] && [[ "$OPTIMAL_PROTO" != -ssl2 ]]; then
           cp "$TEMPDIR/$NODEIP.determine_tls_extensions.txt" $TMPFILE
           >$ERRFILE
-          [[ -z "$sessticket_lifetime_hint" ]] && sessticket_lifetime_hint=$(awk '/session ticket lifetime/' $TMPFILE)
+          if [[ -z "$sessticket_lifetime_hint" ]]; then
+               sessticket_lifetime_hint=$(awk '/session ticket lifetime/ { if (!found) print; found=1 }' $TMPFILE)
+               sessticket_proto="$(get_protocol "$TMPFILE")"
+          fi
      fi
-     if "$using_sockets" && [[ -z "$sessticket_lifetime_hint" ]] && [[ "$OPTIMAL_PROTO" != -ssl2 ]]; then
-          $OPENSSL s_client $(s_client_options "$STARTTLS $BUGS "$OPTIMAL_PROTO" -connect $NODEIP:$PORT $PROXY $SNI") </dev/null 2>$ERRFILE >$TMPFILE
-          sclient_connect_successful $? $TMPFILE && sessticket_lifetime_hint=$(awk '/session ticket lifetime/' $TMPFILE)
+     if "$using_sockets" && ! "$TLS13_ONLY" && [[ -z "$sessticket_lifetime_hint" ]] && [[ "$OPTIMAL_PROTO" != -ssl2 ]]; then
+          if "$HAS_TLS13" && ( [[ -z "$OPTIMAL_PROTO" ]] || [[ "$OPTIMAL_PROTO" == -tls1_3 ]] ) ; then
+               # If a session ticket were sent in response to a TLSv1.3 ClientHello, then a session ticket
+               # would have been found by get_server_certificate(). So, try again with a TLSv1.2 ClientHello.
+               $OPENSSL s_client $(s_client_options "$STARTTLS $BUGS -no_tls1_3 -connect $NODEIP:$PORT $PROXY $SNI") </dev/null 2>$ERRFILE >$TMPFILE
+          else
+               $OPENSSL s_client $(s_client_options "$STARTTLS $BUGS "$OPTIMAL_PROTO" -connect $NODEIP:$PORT $PROXY $SNI") </dev/null 2>$ERRFILE >$TMPFILE
+          fi
+          if sclient_connect_successful $? $TMPFILE; then
+               sessticket_lifetime_hint=$(awk '/session ticket lifetime/ { if (!found) print; found=1 }' $TMPFILE)
+               sessticket_proto="$(get_protocol "$TMPFILE")"
+          fi
      fi
      [[ -z "$sessticket_lifetime_hint" ]] && TLS_TICKETS=false || TLS_TICKETS=true
 
@@ -9071,7 +9130,7 @@ run_server_defaults() {
 
      pr_bold " Session Resumption           "
      jsonID="sessionresumption_ticket"
-     sub_session_resumption
+     sub_session_resumption "$sessticket_proto"
      case $? in
           0) SESS_RESUMPTION[2]="ticket=yes"
              out "Tickets: yes, "
@@ -9103,7 +9162,7 @@ run_server_defaults() {
           outln "ID: no"
           fileout "$jsonID" "INFO" "No Session ID, no resumption"
      else
-          sub_session_resumption ID
+          sub_session_resumption "$sessticket_proto" ID
           case $? in
                0) SESS_RESUMPTION[1]="ID=yes"
                   outln "ID: yes"
@@ -9171,7 +9230,14 @@ run_server_defaults() {
           fi
      elif [[ $certs_found -eq 0 ]] && [[ -s "$HOSTCERT" ]]; then
           outln
-          generic_nonfatal "Client problem, shouldn't happen: Host certificate found but we can't continue with \"server defaults\""
+          generic_nonfatal "Client problem, shouldn't happen: Host certificate found but we can't continue with \"server defaults\"."
+     elif [[ $certs_found -eq 0 ]]; then
+          outln
+          if $TLS13_ONLY; then
+               generic_nonfatal "Client problem: We need openssl supporting TLS 1.3. We can't continue with \"server defaults\" as we cannot retrieve the certificate. "
+          else
+               generic_nonfatal "Client problem, No server cerificate could be retrieved. Thus we can't continue with \"server defaults\"."
+          fi
      fi
      [[ $DEBUG -ge 1 ]] && [[ -e $HOSTCERT.nosni ]] && $OPENSSL x509 -in $HOSTCERT.nosni -text -noout 2>>$ERRFILE > $HOSTCERT.nosni.txt
 
@@ -11461,7 +11527,7 @@ parse_tls_serverhello() {
                else
                     # This could just be a result of the server's response being
                     # split across two or more packets.
-                    continue
+                    break
                fi
           fi
           tls_content_type="${tls_hello_ascii:i:2}"
@@ -15114,16 +15180,16 @@ run_drown() {
                fi
                ;;
           *)   prln_svrty_best "not vulnerable on this host and port (OK)"
-               fileout "DROWN" "OK" "not vulnerable to DROWN on this host and port" "$cve" "$cwe"
+               fileout "$jsonID" "OK" "not vulnerable on this host and port" "$cve" "$cwe"
                if [[ -n "$cert_fingerprint_sha2" ]]; then
                     outln "$spaces make sure you don't use this certificate elsewhere with SSLv2 enabled services"
                     out "$spaces "
                     pr_url "https://censys.io/ipv4?q=$cert_fingerprint_sha2"
                     outln " could help you to find out"
-                    fileout "$jsonID" "INFO" "Make sure you don't use this certificate elsewhere with SSLv2 enabled services, see https://censys.io/ipv4?q=$cert_fingerprint_sha2" "$cve" "$cwe"
+                    fileout "${jsonID}_hint" "INFO" "Make sure you don't use this certificate elsewhere with SSLv2 enabled services, see https://censys.io/ipv4?q=$cert_fingerprint_sha2" "$cve" "$cwe"
                else
                     outln "$spaces no RSA certificate, thus certificate can't be used with SSLv2 elsewhere"
-                    fileout "$jsonID" "INFO" "no RSA certificate, can't be used with SSLv2 elsewhere" "$cve" "$cwe"
+                    fileout "${jsonID}_hint" "INFO" "no RSA certificate, can't be used with SSLv2 elsewhere" "$cve" "$cwe"
                fi
                ;;
      esac
@@ -15616,8 +15682,8 @@ run_rc4() {
      done
 
      for proto in -no_ssl2 -tls1_1 -tls1 -ssl3; do
-          [[ "$proto" != "-no_ssl2" ]] && [[ $(has_server_protocol "${proto:1}") -eq 1 ]] && continue
-          ! "$HAS_SSL3" && [[ "$proto" == "-ssl3" ]] && continue
+          [[ "$proto" != -no_ssl2 ]] && [[ $(has_server_protocol "${proto:1}") -eq 1 ]] && continue
+          ! "$HAS_SSL3" && [[ "$proto" == -ssl3 ]] && continue
           while true; do
                ciphers_to_test=""
                for (( i=0; i < nr_ossl_ciphers; i++ )); do
@@ -15785,7 +15851,6 @@ run_grease() {
      for (( i=0; i < 5; i++ )); do
           case $i in
                0) proto="03" ; cipher_list="$TLS12_CIPHER" ;;
-               1) proto="03" ; cipher_list="$TLS12_CIPHER_2ND_TRY" ;;
                2) proto="02" ; cipher_list="$TLS_CIPHER" ;;
                3) proto="01" ; cipher_list="$TLS_CIPHER" ;;
                4) proto="00" ; cipher_list="$TLS_CIPHER" ;;
@@ -16540,6 +16605,35 @@ find_openssl_binary() {
          OPENSSL_LOCATION="$openssl_location"
      fi
 
+     OSSL_CIPHERS_S=""
+     HAS_SSL2=false
+     HAS_SSL3=false
+     HAS_TLS13=false
+     HAS_X448=false
+     HAS_X25519=false
+     HAS_NO_SSL2=false
+     HAS_NOSERVERNAME=false
+     HAS_CIPHERSUITES=false
+     HAS_COMP=false
+     HAS_NO_COMP=false
+     OSSL_SUPPORTED_CURVES=""
+     HAS_PKEY=false
+     HAS_PKUTIL=false
+     HAS_ALPN=false
+     HAS_NPN=false
+     HAS_FALLBACK_SCSV=false
+     HAS_PROXY=false
+     HAS_XMPP=false
+     HAS_POSTGRES=false
+     HAS_MYSQL=false
+     HAS_LMTP=false
+     HAS_NNTP=false
+     HAS_IRC=false
+     HAS_CHACHA20=false
+     HAS_AES128_GCM=false
+     HAS_AES256_GCM=false
+     HAS_ZLIB=false
+     
      $OPENSSL ciphers -s 2>&1 | grep -aq "unknown option" || \
           OSSL_CIPHERS_S="-s"
 
@@ -17684,69 +17778,150 @@ sclient_auth() {
      return 1
 }
 
-
-# This is a helper function for determine_optimal_proto() below. It sets the
-# the global STARTTLS_OPTIMAL_PROTO / OPTIMAL_PROTO accordingly and returns 1
-# if no protocol could be determined and 0 if this was possible.
-#
-determine_optimal_proto_sockets_helper() {
+# Determine the best parameters to use with tls_sockets():
+#   For TLSv1.3, determine what extension number to use for the key_share extension.
+#   For TLSv1.2, determine what cipher list to send, since there are more than 128
+#   TLSv1.2 ciphers and some servers fail if the ClientHello contains too many ciphers.
+# If both TLSv1.3 and TLSv1.2 ClientHello messages result in failed connection attempts,
+# then try to determine whether:
+#   (1) This is an SSLv2-only server
+#   (2) This server supports some protocol in SSLv3 - TLSv1.1, but cannot handle version negotiation.
+#   (3) This is not a TLS/SSL enabled server.
+# This information can be used by determine_optimal_proto() to help distinguish between a server
+# that is not TLS/SSL enabled and one that is not compatible with the version of OpenSSL being used.
+determine_optimal_sockets_params() {
+     local -i ret1=1 ret2=1
+     local i proto cipher_offered
      local all_failed=true
-     local proto=""
-     local optimal_proto=""
-     local starttls="$1"
-     local -i ret
 
-     for proto in 03 01 04 00 02 22; do
-          case $proto in
-               03) tls_sockets "$proto" "$TLS12_CIPHER"
-                    ret=$?
-                    if [[ $ret -eq 0 ]] || [[ $ret -eq 2 ]]; then
-                         case $DETECTED_TLS_VERSION in
-                              0303)  add_tls_offered tls1_2 yes; optimal_proto="-tls1_2" ;;
-                              0302)  add_tls_offered tls1_1 yes; optimal_proto="-tls1_1" ;;
-                              0301)  add_tls_offered tls1 yes; optimal_proto="-tls1" ;;
-                              0300)  add_tls_offered ssl3 yes; optimal_proto="-ssl3" ;;
-                         esac
-                         all_failed=false
-                         break
-                    fi ;;
-               04) tls_sockets "$proto" "$TLS13_CIPHER"
-                    if [[ $? -eq 0 ]]; then
-                         add_tls_offered tls1_3 yes; optimal_proto="-tls1_3"
-                         all_failed=false
-                         break
-                    fi ;;
-               01|00|02) tls_sockets "$proto" "$TLS_CIPHER" "" "" "true"
-                    ret=$?
-                    if [[ $ret -eq 0 ]] || [[ $ret -eq 2 ]]; then
-                         case $DETECTED_TLS_VERSION in
-                              0302)  add_tls_offered tls1_1 yes; optimal_proto="-tls1_1" ;;
-                              0301)  add_tls_offered tls1 yes; optimal_proto="-tls1" ;;
-                              0300)  add_tls_offered ssl3 yes; optimal_proto="-ssl3" ;;
-                         esac
-                         all_failed=false
-                         break
-                    fi ;;
-               22)  sslv2_sockets
-                    [[ $? -eq 3 ]] && all_failed=false && add_tls_offered ssl2 yes && optimal_proto="-ssl2"
-                    ;;
-          esac
-     done
-     [[ "$proto" != 22 ]] && cp $TEMPDIR/$NODEIP.parse_tls_serverhello.txt $TMPFILE
-     debugme echo "proto: $proto"
+     # If a STARTTLS protocol is specified and $SSL_NATIVE is true, then skip this test, since 
+     # $SSL_NATIVE may have been set to true as a result of tls_sockets() not supporting the STARTTLS
+     # protocol.
+     [[ -n "$STARTTLS_PROTOCOL" ]] && "$SSL_NATIVE" && return 0
 
-     if [[ -n "$starttls" ]]; then
-          STARTTLS_OPTIMAL_PROTO="$optimal_proto"
+     # NOTE: The following code is only needed as long as draft versions of TLSv1.3 prior to draft 23
+     # are supported. It is used to determine whether a draft 23 or pre-draft 23 ClientHello should be
+     # sent.
+     KEY_SHARE_EXTN_NR="33"
+     tls_sockets "04" "$TLS13_CIPHER" "" "00, 2b, 00, 0f, 0e, 03,04, 7f,1c, 7f,1b, 7f,1a, 7f,19, 7f,18, 7f,17"
+     if [[ $? -eq 0 ]]; then
+          add_tls_offered tls1_3 yes
+          all_failed=false
      else
-          OPTIMAL_PROTO="$optimal_proto"
+          KEY_SHARE_EXTN_NR="28"
+          tls_sockets "04" "$TLS13_CIPHER" "" "00, 2b, 00, 0b, 0a, 7f,16, 7f,15, 7f,14, 7f,13, 7f,12"
+          if [[ $? -eq 0 ]]; then
+               add_tls_offered tls1_3 yes
+               all_failed=false
+          else
+               add_tls_offered tls1_3 no
+               KEY_SHARE_EXTN_NR="33"
+          fi
+     fi
+     if ! "$all_failed"; then
+          # Determine which version of TLS 1.3 was offered. For drafts 18-21 the
+          # version appears in the ProtocolVersion field of the ServerHello. For
+          # drafts 22-28 and the final TLS 1.3 the ProtocolVersion field contains
+          # 0303 and the actual version appears in the supported_versions extension.
+          if [[ "${TLS_SERVER_HELLO:8:3}" == 7F1 ]]; then
+               add_tls_offered tls1_3_draft$(hex2dec "${TLS_SERVER_HELLO:10:2}") yes
+          elif [[ "$TLS_SERVER_HELLO" =~ 002B00020304 ]]; then
+               add_tls_offered tls1_3_rfc8446 yes
+          else
+               for i in 1C 1B 1A 19 18 17 16 15 14 13 12; do
+                    if [[ "$TLS_SERVER_HELLO" =~ 002B00027F$i ]]; then
+                         add_tls_offered tls1_3_draft$(hex2dec "$i") yes
+                         break
+                    fi
+               done
+          fi
+     fi
+
+     # Need to determine which set of ciphers is best to use with
+     # a TLSv1.2 ClientHello since there are far more than 128 ciphers
+     # that can be used.
+     tls_sockets "03" "$TLS12_CIPHER"
+     ret1=$?
+     if [[ $ret1 -eq 0 ]] || [[ $ret1 -eq 2 ]]; then
+          case $DETECTED_TLS_VERSION in
+               0303)  add_tls_offered tls1_2 yes ;;
+               0302)  add_tls_offered tls1_1 yes ;;
+               0301)  add_tls_offered tls1 yes ;;
+               0300)  add_tls_offered ssl3 yes ;;
+          esac
+          all_failed=false
+     fi
+
+     # Try again with a different, less common, set of cipher suites
+     # see #807 and #806. If using these cipher suites results in a
+     # successful connection, then change $TLS12_CIPHER to these
+     # cipher suites so that later tests will use this list of cipher
+     # suites.
+     if [[ $ret1 -ne 0 ]]; then
+          tls_sockets "03" "$TLS12_CIPHER_2ND_TRY"
+          ret2=$?
+          if [[ $ret2 -eq 0 ]]; then
+               add_tls_offered tls1_2 yes
+               TLS12_CIPHER="$TLS12_CIPHER_2ND_TRY"
+               all_failed=false
+          else
+               add_tls_offered tls1_2 no
+          fi
+          if [[ $ret2 -eq 2 ]]; then
+               case $DETECTED_TLS_VERSION in
+                    0302)  add_tls_offered tls1_1 yes ;;
+                    0301)  add_tls_offered tls1 yes ;;
+                    0300)  add_tls_offered ssl3 yes ;;
+               esac
+               [[ $ret1 -ne 2 ]] && TLS12_CIPHER="$TLS12_CIPHER_2ND_TRY"
+               all_failed=false
+          fi
+     fi
+     if [[ $ret1 -eq 0 ]] || [[ $ret2 -eq 0 ]]; then
+          cipher_offered="$(get_cipher "$TEMPDIR/$NODEIP.parse_tls_serverhello.txt")"
+          if [[ "$cipher_offered" == TLS_* ]] || [[ "$cipher_offered" == SSL_* ]]; then
+               cipher_offered="$(rfc2hexcode "$cipher_offered")"
+          else
+               cipher_offered="$(openssl2hexcode "$cipher_offered")"
+          fi
+          [[ ${#cipher_offered} -eq 9 ]] && TLS12_CIPHER_OFFERED="${cipher_offered:2:2},${cipher_offered:7:2}"
      fi
 
      if "$all_failed"; then
-          return 1
-     else
-          return 0
+          # One of the following must be true:
+          #   * This is not a TLS/SSL enabled server.
+          #   * The server only supports SSLv2
+          #   * The server does not handle version negotiation correctly.
+          for proto in 01 00 02; do
+               tls_sockets "$proto" "$TLS_CIPHER" "" "" "true"
+               ret1=$?
+               if [[ $ret1 -ne 0 ]]; then
+                    case $proto in
+                         02)  add_tls_offered tls1_1 no ;;
+                         01)  add_tls_offered tls1 no ;;
+                         00)  add_tls_offered ssl3 no ;;
+                    esac
+               fi
+               if [[ $ret1 -eq 0 ]] || [[ $ret1 -eq 2 ]]; then
+                    case $DETECTED_TLS_VERSION in
+                         0302)  add_tls_offered tls1_1 yes ;;
+                         0301)  add_tls_offered tls1 yes ;;
+                         0300)  add_tls_offered ssl3 yes ;;
+                    esac
+                    OPTIMAL_SOCKETS_PROTO="$proto"
+                    all_failed=false
+                    break
+               fi
+          done
      fi
+     if "$all_failed"; then
+          sslv2_sockets
+          [[ $? -eq 3 ]] && all_failed=false && add_tls_offered ssl2 yes
+     fi
+     ALL_FAILED_SOCKETS="$all_failed"
+     return 0
 }
+
 
 # This function determines (STARTTLS_)OPTIMAL_PROTO. It is basically a workaround function as under certain
 # circumstances a ClientHello without specifying a protocol will fail.
@@ -17759,91 +17934,105 @@ determine_optimal_proto_sockets_helper() {
 determine_optimal_proto() {
      local all_failed=true
      local tmp=""
-     local using_sockets=true
+     local proto optimal_proto
 
      "$do_tls_sockets" && return 0
 
      >$ERRFILE
-     "$SSL_NATIVE" && using_sockets=false
-
      if [[ -n "$1" ]]; then
-          # STARTTLS
-          if "$using_sockets"; then
-               determine_optimal_proto_sockets_helper "$1"
-               [[ $? -eq 1 ]] && all_failed=true || all_failed=false
-          else
-               # No sockets
-               # STARTTLS workaround needed see https://github.com/drwetter/testssl.sh/issues/188 -- kind of odd
-               for STARTTLS_OPTIMAL_PROTO in -tls1_2 -tls1 -ssl3 -tls1_1 -tls1_3 -ssl2; do
-                    case $STARTTLS_OPTIMAL_PROTO in
-                         -tls1_3) "$HAS_TLS13" || continue ;;
-                         -ssl3)   "$HAS_SSL3" || continue ;;
-                         -ssl2)   "$HAS_SSL2" || continue ;;
-                         *) ;;
-                    esac
-                    #FIXME: to be replaced / added by socket ( if "$using_sockets" ...)
-                    $OPENSSL s_client $(s_client_options "$STARTTLS_OPTIMAL_PROTO $BUGS -connect "$NODEIP:$PORT" $PROXY -msg -starttls $1" $SNI) </dev/null >$TMPFILE 2>>$ERRFILE
-                    if sclient_auth $? $TMPFILE; then
-                         all_failed=false
-                         break
-                    fi
-                    all_failed=true
-               done
-               "$all_failed" && STARTTLS_OPTIMAL_PROTO=""
-          fi
+          # STARTTLS workaround needed see https://github.com/drwetter/testssl.sh/issues/188 -- kind of odd
+          for STARTTLS_OPTIMAL_PROTO in -tls1_2 -tls1 -ssl3 -tls1_1 -tls1_3 -ssl2; do
+               case $STARTTLS_OPTIMAL_PROTO in
+                    -tls1_3) "$HAS_TLS13" || continue ;;
+                    -ssl3)   "$HAS_SSL3" || continue ;;
+                    -ssl2)   "$HAS_SSL2" || continue ;;
+                    *) ;;
+               esac
+               $OPENSSL s_client $(s_client_options "$STARTTLS_OPTIMAL_PROTO $BUGS -connect "$NODEIP:$PORT" $PROXY -msg -starttls $1" $SNI) </dev/null >$TMPFILE 2>>$ERRFILE
+               if sclient_auth $? $TMPFILE; then
+                    all_failed=false
+                    add_tls_offered "${proto/-/}" yes
+                    break
+               fi
+          done
+          "$all_failed" && STARTTLS_OPTIMAL_PROTO=""
+          optimal_proto="$STARTTLS_OPTIMAL_PROTO"
           debugme echo "STARTTLS_OPTIMAL_PROTO: $STARTTLS_OPTIMAL_PROTO"
      else
           # No STARTTLS
-          if "$using_sockets"; then
-               determine_optimal_proto_sockets_helper
-               [[ $? -eq 1 ]] && all_failed=true || all_failed=false
-          else
-               # no sockets
-               for OPTIMAL_PROTO in '' -tls1_2 -tls1 -tls1_3 -ssl3 -tls1_1 -ssl2; do
-                    case $OPTIMAL_PROTO in
-                         -tls1_3) "$HAS_TLS13" || continue ;;
-                         -ssl3)   "$HAS_SSL3" || continue ;;
-                         -ssl2)   "$HAS_SSL2" || continue ;;
-                         *) ;;
-                    esac
-                    $OPENSSL s_client $(s_client_options "$OPTIMAL_PROTO $BUGS -connect "$NODEIP:$PORT" -msg $PROXY $SNI") </dev/null >$TMPFILE 2>>$ERRFILE
-                    if sclient_auth $? $TMPFILE; then
-                         # we use the successful handshake at least to get one valid protocol supported -- it saves us time later
-                         if [[ -z "$OPTIMAL_PROTO" ]]; then
-                              # convert to openssl terminology
-                              tmp=$(get_protocol $TMPFILE)
-                              tmp=${tmp/\./_}
-                              tmp=${tmp/v/}
-                              tmp="$(tolower $tmp)"
-                              add_tls_offered "${tmp}" yes
-                              case $tmp in
-                                   tls1)   OPTIMAL_PROTO="-tls1" ;;
-                                   tls1_1) OPTIMAL_PROTO="-tls1_1" ;;
-                                   tls1_2) OPTIMAL_PROTO="-tls1_2" ;;
-                                   tls1_3) OPTIMAL_PROTO="-tls1_3" ;;
-                                   ssl2)   OPTIMAL_PROTO="-ssl2" ;;
-                              esac
-                         else
-                              add_tls_offered "${OPTIMAL_PROTO/-/}" yes
-                         fi
+          for proto in '' -tls1_2 -tls1 -tls1_3 -ssl3 -tls1_1 -ssl2; do
+               case $proto in
+                    -tls1_3) "$HAS_TLS13" || continue ;;
+                    -ssl3)   "$HAS_SSL3" || continue ;;
+                    -ssl2)   "$HAS_SSL2" || continue ;;
+                    *) ;;
+               esac
+               $OPENSSL s_client $(s_client_options "$proto $BUGS -connect "$NODEIP:$PORT" -msg $PROXY $SNI") </dev/null >$TMPFILE 2>>$ERRFILE
+               if sclient_auth $? $TMPFILE; then
+                    # we use the successful handshake at least to get one valid protocol supported -- it saves us time later
+                    if [[ -z "$proto" ]]; then
+                         # convert to openssl terminology
+                         tmp=$(get_protocol $TMPFILE)
+                         tmp=${tmp/\./_}
+                         tmp=${tmp/v/}
+                         tmp="$(tolower $tmp)"
+                         add_tls_offered "${tmp}" yes
                          debugme echo "one proto determined: $tmp"
-                         all_failed=false
-                         break
+                         OPTIMAL_PROTO=""
+                    else
+                         add_tls_offered "${proto/-/}" yes
+                         OPTIMAL_PROTO="$proto"
                     fi
-                    all_failed=true
-               done
-          fi
+                    all_failed=false
+                    break
+               fi
+          done
           "$all_failed" && OPTIMAL_PROTO=""
-          if [[ "$OPTIMAL_PROTO" == -ssl2 ]]; then
-               prln_magenta "$NODEIP:$PORT appears to only support SSLv2."
-               ignore_no_or_lame " Type \"yes\" to proceed and accept false negatives or positives" "yes"
-               [[ $? -ne 0 ]] && exit $ERR_CLUELESS
-          fi
+          optimal_proto="$OPTIMAL_PROTO"
+
           debugme echo "OPTIMAL_PROTO: $OPTIMAL_PROTO"
      fi
-     [[ "$OPTIMAL_PROTO" != -ssl2 ]]  && ! "$all_failed" && grep -q '^Server Temp Key' $TMPFILE && HAS_DH_BITS=true     # FIX #190
+     [[ "$optimal_proto" != -ssl2 ]]  && ! "$all_failed" && grep -q '^Server Temp Key' $TMPFILE && HAS_DH_BITS=true     # FIX #190
+     if [[ "$(has_server_protocol "tls1_3")" -eq 0 ]] && [[ "$(has_server_protocol "tls1_2")" -ne 0 ]] &&
+        [[ "$(has_server_protocol "tls1_1")" -ne 0 ]] && [[ "$(has_server_protocol "tls1")" -ne 0 ]] &&
+        [[ "$(has_server_protocol "ssl3")" -ne 0 ]]; then
+          TLS13_ONLY=true
+     fi
 
-     if "$all_failed"; then
+     if [[ "$optimal_proto" == -ssl2 ]]; then
+          prln_magenta "$NODEIP:$PORT appears to only support SSLv2."
+          ignore_no_or_lame " Type \"yes\" to proceed and accept false negatives or positives" "yes"
+          [[ $? -ne 0 ]] && exit $ERR_CLUELESS
+     elif "$all_failed" && ! "$ALL_FAILED_SOCKETS"; then
+          if ! "$HAS_TLS13" && "$TLS13_ONLY"; then
+               pr_magenta " $NODE:$PORT appears to support TLS 1.3 ONLY. You better use --openssl=<path_to_openssl_supporting_TLS_1.3>"
+               if ! "$OSSL_SHORTCUT" || [[ ! -x /usr/bin/openssl ]] || /usr/bin/openssl s_client -tls1_3 -connect x 2>&1 | grep -aq "unknown option"; then
+                    outln
+                    ignore_no_or_lame " Type \"yes\" to proceed and accept all scan problems" "yes"
+                    [[ $? -ne 0 ]] && exit $ERR_CLUELESS
+                    MAX_OSSL_FAIL=10
+               else
+                    # dirty hack but an idea for the future to be implemented upfront: Now we know, we'll better off
+                    # with the OS supplied openssl binary. We need to inittialize variables / arrays again though.
+                    # And the service detection can't be made up for now
+                    outln ", \n proceeding with /usr/bin/openssl"
+                    OPENSSL=/usr/bin/openssl
+                    find_openssl_binary
+                    prepare_arrays
+               fi
+          elif ! "$HAS_SSL3" && [[ "$(has_server_protocol "ssl3")" -eq 0 ]] && [[ "$(has_server_protocol "tls1_3")" -ne 0 ]] && \
+               [[ "$(has_server_protocol "tls1_2")" -ne 0 ]] && [[ "$(has_server_protocol "tls1_1")" -ne 0 ]] &&
+               [[ "$(has_server_protocol "tls1")" -ne 0 ]]; then
+               prln_magenta " $NODE:$PORT appears to support SSLv3 ONLY. You better use --openssl=<path_to_openssl_supporting_SSL_3>"
+               ignore_no_or_lame " Type \"yes\" to proceed and accept all scan problems" "yes"
+               [[ $? -ne 0 ]] && exit $ERR_CLUELESS
+               MAX_OSSL_FAIL=10
+          else
+               prln_bold " Your $OPENSSL cannot connect to $NODEIP:$PORT"
+               ignore_no_or_lame " The results might look ok but they could be nonsense. Really proceed ? (\"yes\" to continue)" "yes"
+               [[ $? -ne 0 ]] && exit $ERR_CLUELESS
+          fi
+     elif "$all_failed"; then
           outln
           if "$HAS_IPv6"; then
                pr_bold " Your $OPENSSL is not IPv6 aware, or $NODEIP:$PORT "
@@ -17854,26 +18043,14 @@ determine_optimal_proto() {
           prln_bold "doesn't seem to be a TLS/SSL enabled server";
           ignore_no_or_lame " The results might look ok but they could be nonsense. Really proceed ? (\"yes\" to continue)" "yes"
           [[ $? -ne 0 ]] && exit $ERR_CLUELESS
-     fi
-
-     # NOTE: The following code is only needed as long as draft versions of TLSv1.3 prior to draft 23
-     # are supported. It is used to determine whether a draft 23 or pre-draft 23 ClientHello should be
-     # sent.
-     if [[ -z "$1" ]]; then
-          KEY_SHARE_EXTN_NR="33"
-          tls_sockets "04" "$TLS13_CIPHER" "" "00, 2b, 00, 0f, 0e, 03,04, 7f,1c, 7f,1b, 7f,1a, 7f,19, 7f,18, 7f,17"
-          if [[ $? -eq 0 ]]; then
-               add_tls_offered tls1_3 yes
-          else
-               KEY_SHARE_EXTN_NR="28"
-               tls_sockets "04" "$TLS13_CIPHER" "" "00, 2b, 00, 0b, 0a, 7f,16, 7f,15, 7f,14, 7f,13, 7f,12"
-               if [[ $? -eq 0 ]]; then
-                    add_tls_offered tls1_3 yes
-               else
-                    add_tls_offered tls1_3 no
-                    KEY_SHARE_EXTN_NR="33"
-               fi
-          fi
+     elif ! "$all_failed" && "$ALL_FAILED_SOCKETS" && ! "$SSL_NATIVE"; then
+          # For some reason connecting with tls_sockets/sslv2_sockets didn't work, but connecting
+          # with $OPENSSL s_client did.
+          # FIXME: Should we include some sort of "please report" note here?
+          prln_magenta " Testing with $NODE:$PORT only worked using $OPENSSL."
+          prln_magenta " Test results may be somewhat better if the --ssl-native option is used."
+          ignore_no_or_lame " Type \"yes\" to proceed and accept false negatives or positives" "yes"
+          [[ $? -ne 0 ]] && exit $ERR_CLUELESS
      fi
 
      tmpfile_handle ${FUNCNAME[0]}.txt
@@ -17905,6 +18082,7 @@ determine_service() {
      outln
      if [[ -z "$1" ]]; then
           # no STARTTLS.
+          determine_optimal_sockets_params
           determine_optimal_proto
           $SNEAKY && \
                ua="$UA_SNEAKY" || \
@@ -17965,6 +18143,7 @@ determine_service() {
                               fatal "Your $OPENSSL does not support the \"-starttls nntp\" option" $ERR_OSSLBIN
                          fi
                     fi
+                    determine_optimal_sockets_params
                     determine_optimal_proto "$1"
 
                     out " Service set:$CORRECT_SPACES            STARTTLS via "
@@ -17988,68 +18167,39 @@ determine_service() {
 # Return value is 0 unless we have a problem executing
 #
 determine_sizelimitbug() {
-     local test_ciphers='CC,14, CC,13, CC,15, C0,30, C0,2C, C0,28, C0,24, 00,A5, 00,A3, 00,A1, 00,9F, CC,A9, CC,A8, CC,AA, C0,AF, C0,AD, C0,A3, C0,9F, 00,6B, 00,6A, 00,69, 00,68, C0,77, C0,73, 00,C4, 00,C3, 00,C2, 00,C1, C0,32, C0,2E, C0,2A, C0,26, C0,79, C0,75, 00,9D, C0,A1, C0,9D, 00,3D, 00,C0, C0,3D, C0,3F, C0,41, C0,43, C0,45, C0,49, C0,4B, C0,4D, C0,4F, C0,51, C0,53, C0,55, C0,57, C0,59, C0,5D, C0,5F, C0,61, C0,63, C0,7B, C0,7D, C0,7F, C0,81, C0,83, C0,87, C0,89, C0,8B, C0,8D, 16,B7, 16,B8, 16,B9, 16,BA, C0,2F, C0,2B, C0,27, C0,23, 00,A4, 00,A2, 00,A0, 00,9E, C0,AE, C0,AC, C0,A2, C0,9E, C0,A0, C0,9C, 00,67, 00,40, 00,3F, 00,3E, C0,76, C0,72, 00,BE, 00,BD, 00,BC, 00,BB, C0,31, C0,2D, C0,29, C0,25, C0,78, C0,74, 00,9C, 00,3C, 00,BA, C0,3C, C0,3E, C0,40, C0,42, C0,44, C0,48, C0,4A, C0,4C, C0,4E, C0,50, C0,52, C0,54, C0,56, C0,58, C0,5C, C0,5E, C0,60, C0,62, C0,7A, C0,7C, C0,7E, C0,80, C0,82'
-     local overflow_cipher1='C0,86'
-     local overflow_cipher2='C0,88'
+     # overflow_cipher must be some cipher that does not appear in TLS12_CIPHER.
+     local overflow_cipher='C0,86'
+     local -i nr_ciphers
 
      # For STARTTLS protcols not being implemented yet via sockets this is a bypass otherwise it won't be usable at all (e.g. LDAP)
      # Fixme: find out whether we can't skip this in general for STARTTLS
      [[ "$STARTTLS" =~ ldap ]] && return 0
      [[ "$STARTTLS" =~ irc ]] && return 0
 
-     debugme echo -n "${FUNCNAME[0]} starting at # of ciphers (excl. 00FF): "
-     debugme echo  "$(tr ' ' '\n' <<< "$test_ciphers" | wc -l)"
      # Only with TLS 1.2 offered at the server side it is possible to hit this bug, in practise. Thus
      # we assume if TLS 1.2 is not supported, the server has no cipher size limit bug. It still may,
      # theoretically, but in a regular check with testssl.sh we won't hit this limit with lower protocols.
-     # Upon calling this function we may know already whether TLS 1.2 is supported. If not we just
-     # check for it (and add it to the known protocols to be supported).
-     # Then we send 127 ciphers, check whether they work, and increase it by one and check again. The
-     # limit bug should occur @ 128 ciphers. To be sure we test until 129 ciphers.
+     # Upon calling this function we already know whether TLS 1.2 is supported. If TLS 1.2 is supported, we
+     # send 129 ciphers (including 00FF) and check whether it works.
 
      if [[ 1 -eq $(has_server_protocol 03) ]]; then
           SERVER_SIZE_LIMIT_BUG=false
-     elif [[ 0 -eq $(has_server_protocol 03) ]]; then
-          debugme echo "Sending 127 ciphers"
-          tls_sockets 03 "${test_ciphers}, 00,FF"
-          if [[ $? -eq 0 ]]; then
-               debugme echo "Sending 128 ciphers"
-               tls_sockets 03 "${test_ciphers}, ${overflow_cipher1}, 00,FF"
-               if [[ $? -ne 0 ]]; then
-                    SERVER_SIZE_LIMIT_BUG=true
+     else
+          if [[ "$DEBUG" -ge 1 ]]; then
+               nr_ciphers="$(tr ' ' '\n' <<< "${overflow_cipher}, $TLS12_CIPHER" | sed -e '/^$/d' | wc -l)"
+               if [[ $nr_ciphers -ne 129 ]]; then
+                    prln_warning "FIXME line $LINENO, ${FUNCNAME[0]} sending $nr_ciphers ciphers rather than 129."
                else
-                    debugme echo "Sending 129 ciphers"
-                    tls_sockets 03 "${test_ciphers}, ${overflow_cipher1}, ${overflow_cipher2}, 00,FF"
-                    if [[ $? -ne 0 ]]; then
-                         SERVER_SIZE_LIMIT_BUG=true
-                    else
-                         SERVER_SIZE_LIMIT_BUG=false
-                    fi
+                    debugme echo "${FUNCNAME[0]} sending $nr_ciphers ciphers"
                fi
-               debugme echo -e "\nSERVER_SIZE_LIMIT_BUG: $SERVER_SIZE_LIMIT_BUG"
-          else
-               pr_warning "FIXME line $LINENO, TLS 1.2 handshake in ${FUNCNAME[0]} failed"
-               return 1
           fi
-     elif [[ 2 -eq $(has_server_protocol 03) ]]; then
-          tls_sockets 03 "${test_ciphers}, 00,FF"
+          tls_sockets 03 "${overflow_cipher}, ${TLS12_CIPHER}"
           if [[ $? -eq 0 ]]; then
-               add_tls_offered tls1_2 yes
-               tls_sockets 03 "${test_ciphers}, ${overflow_cipher1}, 00,FF"
-               if [[ $? -ne 0 ]]; then
-                    SERVER_SIZE_LIMIT_BUG=true
-                else
-                    tls_sockets 03 "${test_ciphers}, ${overflow_cipher1}, ${overflow_cipher2}, 00,FF"
-                    if [[ $? -ne 0 ]]; then
-                         SERVER_SIZE_LIMIT_BUG=true
-                    else
-                         SERVER_SIZE_LIMIT_BUG=false
-                    fi
-               fi
-               debugme echo -e "\nSERVER_SIZE_LIMIT_BUG: $SERVER_SIZE_LIMIT_BUG"
+               SERVER_SIZE_LIMIT_BUG=false
           else
-               debugme echo -e "\nNo TLS 1.2 in ${FUNCNAME[0]} found"
+               SERVER_SIZE_LIMIT_BUG=true
           fi
+          debugme echo -e "\nSERVER_SIZE_LIMIT_BUG: $SERVER_SIZE_LIMIT_BUG"
      fi
      if "$SERVER_SIZE_LIMIT_BUG"; then
           out " Pre-test: "
@@ -18697,7 +18847,7 @@ initialize_globals() {
      do_tls_sockets=false
      do_client_simulation=false
      do_display_only=false
-     do_starttls=true
+     do_starttls=false
 }
 
 
@@ -19301,7 +19451,15 @@ parse_cmd_line() {
           fatal "URI missing" $ERR_CMDLINE
      else
      # left off here is the URI
-          URI="$1"
+          if [[ $1 = *[![:ascii:]]* ]]; then
+              if [[ "$(command -v idn)" == "" ]]; then
+                  fatal "URI contains non-ASCII characters, and IDN not available."
+              else
+                  URI="$(echo $1 | idn)"
+              fi
+          else
+              URI="$1"
+          fi
           # parameter after URI supplied:
           [[ -n "$2" ]] && fatal "URI comes last" $ERR_CMDLINE
      fi
@@ -19339,6 +19497,7 @@ reset_hostdepended_vars() {
      PROTOS_OFFERED=""
      CURVES_OFFERED=""
      OPTIMAL_PROTO=""
+     ALL_FAILED_SOCKETS=true
      SERVER_SIZE_LIMIT_BUG=false
 }
 
