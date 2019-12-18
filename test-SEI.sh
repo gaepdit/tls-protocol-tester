@@ -16,6 +16,8 @@ echo "░▒▓█ Testing 10.149.211.68" >> output
 ./testssl.sh -p -q 10.149.211.68 >> output
 echo "░▒▓█ Testing 10.50.33.226" >> output
 ./testssl.sh -p -q 10.50.33.226 >> output
+echo "░▒▓█ Testing 10.50.33.227" >> output
+./testssl.sh -p -q 10.50.33.227 >> output
 
 echo "Generating output file"
 
