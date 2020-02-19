@@ -21,10 +21,10 @@ testssl.sh/testssl.sh -p -q 10.50.33.227 >> output
 
 echo "Generating output file"
 
-cat output | scripts/scripts/ansi2html.sh > SEI-SSL-tests.html
+cat output | scripts/scripts/ansi2html.sh > SSL-test-results.html
 
 echo "Copying to E:/"
 
-cp SEI-SSL-tests.html /mnt/e/docs/testssl-results
+cp SSL-test-results.html /mnt/e/docs/SSL-test-results.html
 
 echo "Done"
